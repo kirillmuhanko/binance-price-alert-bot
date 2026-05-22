@@ -96,7 +96,7 @@ def delete_ticker(ticker: str):
     wb.save(DATA_FILE)
 
 
-def update_row(ticker: str, new_price: float, triggered: bool):
+def update_check_time(ticker: str):
     if not os.path.exists(DATA_FILE):
         return
 
@@ -108,9 +108,6 @@ def update_row(ticker: str, new_price: float, triggered: bool):
         if not row[0].value or str(row[0].value).upper() != ticker:
             continue
         row[2].value = now
-        if triggered:
-            row[1].value = new_price
-            row[3].value = now
         break
 
     wb.save(DATA_FILE)
@@ -149,10 +146,10 @@ async def monitor_loop(bot: Bot):
                         save_ticker(data)
                         continue
 
+                    update_check_time(ticker)
+
                     change_pct = (new_price - old_price) / old_price * 100
                     triggered  = change_pct >= data["notify_above"] or change_pct <= data["notify_below"]
-
-                    update_row(ticker, new_price, triggered)
 
                     if triggered:
                         emoji = "🟢" if change_pct > 0 else "🔴"
