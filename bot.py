@@ -1,9 +1,7 @@
 import asyncio
-import json
 import logging
 import os
-import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 import requests
 import openpyxl
@@ -15,10 +13,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 15)) * 60
-AUDIT_HOUR_UTC = int(os.getenv("AUDIT_HOUR_UTC", 18))
 DATA_FILE      = "watchlist.xlsx"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -29,8 +24,6 @@ logger = logging.getLogger(__name__)
 
 HEADERS = ["ticker", "current_price", "last_check_time", "last_update_time", "notify_above_%", "notify_below_%"]
 
-
-# ----------------------------- Excel helpers ----------------------------- #
 
 def _init_workbook():
     wb = openpyxl.Workbook()
@@ -120,8 +113,6 @@ def update_check_time(ticker: str):
     wb.save(DATA_FILE)
 
 
-# ----------------------------- Binance API (только для алертов) ----------------------------- #
-
 def fetch_prices(symbols: list[str]) -> dict[str, float]:
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=10)
@@ -131,83 +122,6 @@ def fetch_prices(symbols: list[str]) -> dict[str, float]:
         logger.error(f"Binance API error: {e}")
         return {}
 
-
-# ----------------------------- Gemini (сам ищет в интернете) ----------------------------- #
-
-AUDIT_PROMPT_TEMPLATE = """Ты — крипто-аналитик. Проведи аудит токена {ticker} прямо сейчас.
-
-Используй поиск в интернете, чтобы найти АКТУАЛЬНЫЕ данные:
-- Funding rate (текущий и тренд за сутки) на Binance / Bybit perpetuals
-- Open Interest и его изменение за 24ч
-- Long/Short ratio, особенно top traders
-- Объём торгов 24ч, аномалии
-- Изменение цены за 24ч и 7д
-- Расхождение mark price vs index price
-- СВЕЖИЕ новости: листинги/делистинги, хаки, партнёрства, разлоки токенов, апдейты протокола
-- Активность китов / крупные транзакции
-- Любые НЕОБЫЧНЫЕ сигналы
-
-Затем РЕШИ: есть ли ДЕЙСТВИТЕЛЬНО ВАЖНОЕ для трейдера прямо сейчас?
-
-Критерии "важно":
-- Аномальный funding rate (|>0.05%| на 8ч или резкая смена знака)
-- Дивергенция: цена ↑ а OI ↓, или цена ↓ а OI ↑
-- Экстремум long/short ratio (>2.5 или <0.5)
-- Существенное расхождение mark vs index
-- Свежая новость, способная двинуть цену
-- Резкий всплеск объёма без новостей
-- Заметная активность китов
-
-Если НИЧЕГО важного нет — верни СТРОГО JSON: {{"important": false}}
-
-Если есть — верни СТРОГО JSON:
-{{"important": true, "summary": "краткая сводка одним абзацем на русском, с эмодзи 🟢🔴⚠️📈📉 и конкретными цифрами"}}
-
-Никакого текста до или после JSON. Только JSON."""
-
-
-def gemini_audit_ticker(ticker: str) -> dict | None:
-    """Gemini сам ищет в интернете и решает, важно ли. Возвращает dict или None."""
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set, skipping audit")
-        return None
-
-    prompt = AUDIT_PROMPT_TEMPLATE.format(ticker=ticker)
-
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-        r = requests.post(
-            url,
-            params={"key": GEMINI_API_KEY},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "tools": [{"google_search": {}}],   # встроенный поиск Gemini
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
-            },
-            timeout=120,
-        )
-        r.raise_for_status()
-        data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-        # Чистим возможные ```json ... ``` обёртки
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-
-        # Достаём JSON-объект даже если есть лишний текст вокруг
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            logger.warning(f"{ticker}: no JSON in response: {text[:200]}")
-            return None
-
-        return json.loads(match.group(0))
-
-    except Exception as e:
-        logger.error(f"Gemini error for {ticker}: {e}")
-        return None
-
-
-# ----------------------------- Loops ----------------------------- #
 
 async def monitor_loop(bot: Bot):
     logger.info("Monitor started.")
@@ -259,84 +173,6 @@ async def monitor_loop(bot: Bot):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def audit_loop(bot: Bot):
-    """Ждёт AUDIT_HOUR_UTC каждый день и запускает аудит."""
-    logger.info(f"Audit scheduler started (daily at {AUDIT_HOUR_UTC:02d}:00 UTC).")
-    while True:
-        now_utc = datetime.now(timezone.utc)
-        next_run = now_utc.replace(hour=AUDIT_HOUR_UTC, minute=0, second=0, microsecond=0)
-        if next_run <= now_utc:
-            next_run += timedelta(days=1)
-
-        wait_sec = (next_run - now_utc).total_seconds()
-        logger.info(f"Next audit at {next_run.isoformat()} (in {wait_sec/3600:.2f}h)")
-        await asyncio.sleep(wait_sec)
-
-        try:
-            await run_audit(bot)
-        except Exception as e:
-            logger.error(f"Audit error: {e}")
-
-
-async def run_audit(bot: Bot):
-    """По одному тикеру: спрашиваем Gemini. Копим важные находки.
-    В конце шлём ОДНО сообщение. Если ничего важного — полная тишина."""
-    watchlist = load_watchlist()
-    if not watchlist:
-        logger.info("Audit: watchlist empty, skipping.")
-        return
-
-    logger.info(f"Audit started for {len(watchlist)} tickers")
-    findings = []
-
-    for ticker in watchlist:
-        logger.info(f"Auditing {ticker}...")
-        result = await asyncio.to_thread(gemini_audit_ticker, ticker)
-
-        if result and result.get("important") and result.get("summary"):
-            findings.append((ticker, result["summary"]))
-            logger.info(f"{ticker}: important")
-        else:
-            logger.info(f"{ticker}: nothing important")
-
-        # лёгкий троттлинг, чтобы не упереться в rate limit Gemini
-        await asyncio.sleep(2)
-
-    if not findings:
-        logger.info(f"Audit finished. Nothing important across {len(watchlist)} tickers. Staying silent.")
-        return
-
-    # Собираем единое сообщение
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    parts = [f"📊 *Вечерний аудит* — {ts}\n_Важные сигналы: {len(findings)}/{len(watchlist)}_\n"]
-    for ticker, summary in findings:
-        parts.append(f"\n*{ticker}*\n{summary}")
-    text = "\n".join(parts)
-
-    # Telegram лимит 4096 символов — режем при необходимости
-    LIMIT = 4000
-    chunks = []
-    while text:
-        if len(text) <= LIMIT:
-            chunks.append(text)
-            break
-        cut = text.rfind("\n", 0, LIMIT)
-        if cut == -1:
-            cut = LIMIT
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip()
-
-    for chunk in chunks:
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=chunk, parse_mode="Markdown")
-        except Exception:
-            await bot.send_message(chat_id=CHAT_ID, text=chunk)
-
-    logger.info(f"Audit finished. {len(findings)} findings sent in {len(chunks)} chunk(s).")
-
-
-# ----------------------------- Commands ----------------------------- #
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Binance Price Alert Bot*\n\n"
@@ -345,8 +181,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/list` — show watchlist\n"
         "`/prices` — current prices\n"
         "`/setthreshold BTCUSDT 10 -10` — update thresholds\n"
-        "`/export` — download Excel file\n"
-        "`/audit` — run AI audit now",
+        "`/export` — download Excel file",
         parse_mode="Markdown",
     )
 
@@ -457,21 +292,8 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Запускаю аудит...")
-    try:
-        await run_audit(context.bot)
-        # run_audit сам решит, слать ли сводку. Здесь просто отмечаем, что команда отработала.
-        await msg.edit_text("✅ Аудит завершён. (Если ничего не пришло — значит ничего важного)")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
-
-
-# ----------------------------- App ----------------------------- #
-
 async def post_init(application: Application):
     asyncio.create_task(monitor_loop(application.bot))
-    asyncio.create_task(audit_loop(application.bot))
 
 
 def main():
@@ -483,7 +305,6 @@ def main():
     app.add_handler(CommandHandler("prices",       cmd_prices))
     app.add_handler(CommandHandler("setthreshold", cmd_setthreshold))
     app.add_handler(CommandHandler("export",       cmd_export))
-    app.add_handler(CommandHandler("audit",        cmd_audit))
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
 
