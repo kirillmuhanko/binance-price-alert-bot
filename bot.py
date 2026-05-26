@@ -12,9 +12,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID        = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 15)) * 60
-DATA_FILE      = "watchlist.xlsx"
+DATA_FILE = "watchlist.xlsx"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN and CHAT_ID must be set in .env")
@@ -46,12 +46,12 @@ def load_watchlist() -> dict:
             continue
         ticker = str(row[0]).upper()
         result[ticker] = {
-            "ticker":           ticker,
-            "current_price":    float(row[1]) if row[1] else 0.0,
-            "last_check_time":  row[2],
+            "ticker": ticker,
+            "current_price": float(row[1]) if row[1] else 0.0,
+            "last_check_time": row[2],
             "last_update_time": row[3],
-            "notify_above":     float(row[4]),
-            "notify_below":     float(row[5]),
+            "notify_above": float(row[4]),
+            "notify_below": float(row[5]),
         }
     return result
 
@@ -60,8 +60,8 @@ def save_ticker(item: dict):
     if not os.path.exists(DATA_FILE):
         _init_workbook()
 
-    wb  = openpyxl.load_workbook(DATA_FILE)
-    ws  = wb.active
+    wb = openpyxl.load_workbook(DATA_FILE)
+    ws = wb.active
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row_data = [
         item["ticker"],
@@ -100,8 +100,8 @@ def update_check_time(ticker: str):
     if not os.path.exists(DATA_FILE):
         return
 
-    wb  = openpyxl.load_workbook(DATA_FILE)
-    ws  = wb.active
+    wb = openpyxl.load_workbook(DATA_FILE)
+    ws = wb.active
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for row in ws.iter_rows(min_row=2):
@@ -130,7 +130,7 @@ async def monitor_loop(bot: Bot):
             watchlist = load_watchlist()
             if watchlist:
                 prices = fetch_prices(list(watchlist.keys()))
-                now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 for ticker, data in watchlist.items():
                     new_price = prices.get(ticker)
@@ -140,8 +140,8 @@ async def monitor_loop(bot: Bot):
                     old_price = data["current_price"]
 
                     if old_price == 0:
-                        data["current_price"]    = new_price
-                        data["last_check_time"]  = now
+                        data["current_price"] = new_price
+                        data["last_check_time"] = now
                         data["last_update_time"] = now
                         save_ticker(data)
                         continue
@@ -149,7 +149,7 @@ async def monitor_loop(bot: Bot):
                     update_check_time(ticker)
 
                     change_pct = (new_price - old_price) / old_price * 100
-                    triggered  = change_pct >= data["notify_above"] or change_pct <= data["notify_below"]
+                    triggered = change_pct >= data["notify_above"] or change_pct <= data["notify_below"]
 
                     if triggered:
                         emoji = "🟢" if change_pct > 0 else "🔴"
@@ -163,7 +163,7 @@ async def monitor_loop(bot: Bot):
                             parse_mode="Markdown",
                         )
                         logger.info(f"Alert: {ticker} {change_pct:+.2f}%")
-                        data["current_price"]    = new_price
+                        data["current_price"] = new_price
                         data["last_update_time"] = now
                         save_ticker(data)
 
@@ -193,8 +193,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ticker = args[0].upper()
-    above  = float(args[1])
-    below  = float(args[2])
+    above = float(args[1])
+    below = float(args[2])
 
     watchlist = load_watchlist()
     if ticker in watchlist:
@@ -202,12 +202,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     prices = fetch_prices([ticker])
-    price  = prices.get(ticker, 0.0)
+    price = prices.get(ticker, 0.0)
     if price == 0.0:
         await update.message.reply_text(f"❌ Ticker *{ticker}* not found on Binance.", parse_mode="Markdown")
         return
 
-    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     item = {
         "ticker": ticker, "current_price": price,
         "last_check_time": now, "last_update_time": now,
@@ -253,7 +253,7 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     prices = fetch_prices(list(watchlist.keys()))
-    lines  = ["*Current prices:*\n"]
+    lines = ["*Current prices:*\n"]
     for ticker in watchlist:
         p = prices.get(ticker)
         lines.append(f"• *{ticker}*: `${p:,.4f}`" if p else f"• *{ticker}*: N/A")
@@ -266,7 +266,7 @@ async def cmd_setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/setthreshold BTCUSDT 10 -10`", parse_mode="Markdown")
         return
 
-    ticker    = args[0].upper()
+    ticker = args[0].upper()
     watchlist = load_watchlist()
     if ticker not in watchlist:
         await update.message.reply_text(f"❌ {ticker} not in watchlist.")
@@ -281,30 +281,18 @@ async def cmd_setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(DATA_FILE):
-        await update.message.reply_text("File not created yet.")
-        return
-    await update.message.reply_document(
-        document=open(DATA_FILE, "rb"),
-        filename=DATA_FILE,
-        caption="📊 Current watchlist",
-    )
-
-
 async def post_init(application: Application):
     asyncio.create_task(monitor_loop(application.bot))
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("add",          cmd_add))
-    app.add_handler(CommandHandler("remove",       cmd_remove))
-    app.add_handler(CommandHandler("list",         cmd_list))
-    app.add_handler(CommandHandler("prices",       cmd_prices))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("prices", cmd_prices))
     app.add_handler(CommandHandler("setthreshold", cmd_setthreshold))
-    app.add_handler(CommandHandler("export",       cmd_export))
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
 
