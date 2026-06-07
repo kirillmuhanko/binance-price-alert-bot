@@ -15,6 +15,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 15)) * 60
 DATA_FILE = "watchlist.xlsx"
+HEADERS = ["ticker", "current_price", "last_check_time", "last_update_time", "notify_above_%", "notify_below_%"]
+TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     raise RuntimeError("TELEGRAM_TOKEN and CHAT_ID must be set in .env")
@@ -22,10 +24,10 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-HEADERS = ["ticker", "current_price", "last_check_time", "last_update_time", "notify_above_%", "notify_below_%"]
 
+# --- Storage ---
 
-def _init_workbook():
+def init_workbook():
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Watchlist"
@@ -35,7 +37,7 @@ def _init_workbook():
 
 def load_watchlist() -> dict:
     if not os.path.exists(DATA_FILE):
-        _init_workbook()
+        init_workbook()
         return {}
 
     wb = openpyxl.load_workbook(DATA_FILE)
@@ -58,11 +60,11 @@ def load_watchlist() -> dict:
 
 def save_ticker(item: dict):
     if not os.path.exists(DATA_FILE):
-        _init_workbook()
+        init_workbook()
 
     wb = openpyxl.load_workbook(DATA_FILE)
     ws = wb.active
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime(TIME_FMT)
     row_data = [
         item["ticker"],
         item["current_price"],
@@ -102,16 +104,15 @@ def update_check_time(ticker: str):
 
     wb = openpyxl.load_workbook(DATA_FILE)
     ws = wb.active
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    now = datetime.now().strftime(TIME_FMT)
     for row in ws.iter_rows(min_row=2):
-        if not row[0].value or str(row[0].value).upper() != ticker:
-            continue
-        row[2].value = now
-        break
-
+        if row[0].value and str(row[0].value).upper() == ticker:
+            row[2].value = now
+            break
     wb.save(DATA_FILE)
 
+
+# --- Binance ---
 
 def fetch_prices(symbols: list[str]) -> dict[str, float]:
     try:
@@ -123,6 +124,8 @@ def fetch_prices(symbols: list[str]) -> dict[str, float]:
         return {}
 
 
+# --- Monitor ---
+
 async def monitor_loop(bot: Bot):
     logger.info("Monitor started.")
     while True:
@@ -130,7 +133,8 @@ async def monitor_loop(bot: Bot):
             watchlist = load_watchlist()
             if watchlist:
                 prices = fetch_prices(list(watchlist.keys()))
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                now = datetime.now().strftime(TIME_FMT)
+                alerts = []
 
                 for ticker, data in watchlist.items():
                     new_price = prices.get(ticker)
@@ -153,25 +157,29 @@ async def monitor_loop(bot: Bot):
 
                     if triggered:
                         emoji = "🟢" if change_pct > 0 else "🔴"
-                        await bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=(
-                                f"{emoji} *{ticker}* changed by *{change_pct:+.2f}%*\n"
-                                f"Previous price: `${old_price:,.4f}`\n"
-                                f"Current price: `${new_price:,.4f}`"
-                            ),
-                            parse_mode="Markdown",
+                        alerts.append(
+                            f"{emoji} *{ticker}* {change_pct:+.2f}%\n"
+                            f"`${old_price:,.4f}` → `${new_price:,.4f}`"
                         )
                         logger.info(f"Alert: {ticker} {change_pct:+.2f}%")
                         data["current_price"] = new_price
                         data["last_update_time"] = now
                         save_ticker(data)
 
+                if alerts:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text="\n\n".join(alerts),
+                        parse_mode="Markdown",
+                    )
+
         except Exception as e:
             logger.error(f"Monitor error: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
+
+# --- Commands ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -207,11 +215,14 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ticker *{ticker}* not found on Binance.", parse_mode="Markdown")
         return
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime(TIME_FMT)
     item = {
-        "ticker": ticker, "current_price": price,
-        "last_check_time": now, "last_update_time": now,
-        "notify_above": above, "notify_below": below,
+        "ticker": ticker,
+        "current_price": price,
+        "last_check_time": now,
+        "last_update_time": now,
+        "notify_above": above,
+        "notify_below": below,
     }
     save_ticker(item)
     await update.message.reply_text(
@@ -237,7 +248,10 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watchlist = load_watchlist()
     if not watchlist:
-        await update.message.reply_text("Watchlist is empty. Add a ticker: `/add BTCUSDT 5 -5`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Watchlist is empty. Add a ticker: `/add BTCUSDT 5 -5`",
+            parse_mode="Markdown",
+        )
         return
 
     lines = ["*Watchlist:*\n"]
@@ -280,6 +294,8 @@ async def cmd_setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+
+# --- Entry point ---
 
 async def post_init(application: Application):
     asyncio.create_task(monitor_loop(application.bot))
